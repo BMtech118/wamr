@@ -3,7 +3,6 @@ import {
   DisconnectReason,
   useMultiFileAuthState,
   jidDecode,
-  fetchLatestBaileysVersion,
 } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
@@ -17,6 +16,7 @@ import { contactRepository } from '../../repositories/contact.repository.js';
 import { whatsappConnectionRepository } from '../../repositories/whatsapp-connection.repository.js';
 import type { WhatsAppConnectionStatus } from '../../models/whatsapp-connection.model.js';
 import { messageFilterService } from './message-filter.service.js';
+import { resolveWAVersion, invalidateWAVersionCache } from './wa-version.service.js';
 
 /**
  * Baileys message type (simplified for our use case)
@@ -129,15 +129,10 @@ export class WhatsAppClientService {
       this.markOnlineOnConnect = connectionSettings?.markOnlineOnConnect ?? false;
       const markOnlineOnConnect = this.markOnlineOnConnect;
 
-      // Fetch the latest WA web version — WhatsApp rejects outdated versions with 405
-      let waVersion: [number, number, number] = [2, 3000, 1035194821]; // fallback to current known-good
-      try {
-        const { version } = await fetchLatestBaileysVersion();
-        waVersion = version;
-        logger.info({ version: waVersion }, 'Using WA version for connection');
-      } catch (err) {
-        logger.warn({ err }, 'Failed to fetch latest WA version, using fallback');
-      }
+      // Resolve the WA web build. This has to be the *live* one: WhatsApp md5s the
+      // version into the registration buildHash and 405s a stale build before it
+      // ever issues a QR. fetchLatestBaileysVersion() alone is not current enough.
+      const waVersion = await resolveWAVersion();
 
       // Build browser label: WAMR (DEV) in development, WAMR (PROD) in production
       const browserLabel = env.NODE_ENV === 'development' ? 'WAMR (DEV)' : 'WAMR (PROD)';
@@ -327,6 +322,16 @@ export class WhatsAppClientService {
           // Status 515 = "restart required" — happens normally after successful QR pairing.
           // Always allow reconnect for 515 regardless of session state.
           const isRestartRequired = statusCode === 515;
+
+          // Status 405 = WhatsApp refused the registration handshake, nearly always
+          // because the build we announced is stale. Drop the cached version so the
+          // next Connect re-resolves it instead of retrying the same rejected build.
+          if (statusCode === 405) {
+            invalidateWAVersionCache();
+            logger.warn(
+              'WhatsApp rejected registration with 405 (stale client build). Re-resolving the WA web version on next connect.'
+            );
+          }
 
           // Attempt automatic reconnection after a short delay (unless it was a manual logout)
           // Only reconnect if we had a real session OR if WhatsApp asked for a restart (515).
