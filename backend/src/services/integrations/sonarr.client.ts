@@ -223,7 +223,14 @@ export class SonarrClient {
 
       return response.data;
     } catch (error) {
-      logger.error({ error, title: params.title }, 'Failed to add series to Sonarr');
+      const axiosError = error as any;
+      logger.error({
+        error,
+        title: params.title,
+        tvdbId: params.tvdbId,
+        responseStatus: axiosError?.response?.status,
+        responseData: axiosError?.response?.data,
+      }, 'Failed to add series to Sonarr');
       throw error;
     }
   }

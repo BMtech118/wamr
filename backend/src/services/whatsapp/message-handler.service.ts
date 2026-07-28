@@ -66,6 +66,8 @@ class MessageHandlerService {
       if (
         session &&
         [
+          'AWAITING_INPUT',
+          'SEARCHING',
           'AWAITING_SELECTION',
           'AWAITING_SEASON_SELECTION',
           'AWAITING_CONFIRMATION',

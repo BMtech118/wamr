@@ -6,7 +6,7 @@ export type MediaType = 'movie' | 'series' | 'both';
 /**
  * Service types that provide media search
  */
-export type ServiceType = 'radarr' | 'sonarr' | 'seerr';
+export type ServiceType = 'radarr' | 'sonarr' | 'overseerr';
 
 /**
  * Normalized search result structure
@@ -32,10 +32,6 @@ export interface NormalizedResult {
 
   // Source information (for debugging/logging)
   source?: ServiceType;
-
-  // Overseerr media status (1=unknown,2=pending,3=processing,4=partial,5=available)
-  // undefined means Overseerr has no record of this media (safe to request)
-  mediaStatus?: number;
 }
 
 /**
@@ -86,11 +82,6 @@ export interface OverseerrSearchResult {
     tvdbId?: number;
   };
   numberOfSeasons?: number; // For TV series
-  // Populated by Overseerr when the media is known to the system
-  // status: 1=unknown, 2=pending, 3=processing, 4=partially_available, 5=available
-  mediaInfo?: {
-    status: number;
-  };
 }
 
 /**
@@ -153,7 +144,7 @@ export function normalizeSonarrResult(
  */
 export function normalizeOverseerrResult(
   result: OverseerrSearchResult,
-  source: ServiceType = 'seerr'
+  source: ServiceType = 'overseerr'
 ): NormalizedResult {
   const mediaType = result.mediaType === 'movie' ? 'movie' : 'series';
   const title = result.title || result.name || 'Unknown';
@@ -171,9 +162,6 @@ export function normalizeOverseerrResult(
     mediaType,
     seasonCount: result.numberOfSeasons,
     source,
-    // Carry Overseerr's media status so the conversation layer can block duplicate requests.
-    // undefined = Overseerr has no record → safe to request.
-    mediaStatus: result.mediaInfo?.status,
   };
 }
 
@@ -224,140 +212,62 @@ export function sortResultsByYear(results: NormalizedResult[]): NormalizedResult
 }
 
 /**
- * Sort mode for search results
+ * Calculate relevance score for a result against a search query.
+ * Higher score = better match.
  */
-export type SortMode = 'relevance' | 'year-desc';
-
-/**
- * Extract a 4-digit year hint (1900–2099) from the end of a query string.
- * Returns { cleanQuery, yearHint } where cleanQuery has the year stripped.
- */
-export function extractYearHint(query: string): { cleanQuery: string; yearHint: number | null } {
-  const match = query.trim().match(/^(.*?)\s*((?:19|20)\d{2})\s*$/);
-  if (match) {
-    return {
-      cleanQuery: match[1].trim().toLowerCase(),
-      yearHint: parseInt(match[2], 10),
-    };
-  }
-  return { cleanQuery: query.trim().toLowerCase(), yearHint: null };
-}
-
-/**
- * Generate character trigrams from a string (padded with spaces).
- * Used for fuzzy title matching.
- */
-export function getTrigrams(str: string): Set<string> {
-  const padded = ` ${str.toLowerCase()} `;
-  const trigrams = new Set<string>();
-  for (let i = 0; i < padded.length - 2; i++) {
-    trigrams.add(padded.slice(i, i + 3));
-  }
-  return trigrams;
-}
-
-/**
- * Score word overlap between query words and a normalized title.
- * A query word "matches" if any title word starts with that query word.
- * Returns a value in [0, 1].
- */
-export function wordOverlapScore(queryWords: string[], titleNorm: string): number {
-  if (queryWords.length === 0) return 0;
-  const titleWords = titleNorm.split(/\s+/);
-  let matches = 0;
-  for (const qw of queryWords) {
-    if (titleWords.some((tw) => tw.startsWith(qw))) matches++;
-  }
-  return matches / queryWords.length;
-}
-
-/**
- * Score trigram similarity between a normalized query and a normalized title.
- * Returns a value in [0, 1].
- */
-export function trigramSimilarityScore(queryNorm: string, titleNorm: string): number {
-  const queryTrigrams = getTrigrams(queryNorm);
-  if (queryTrigrams.size === 0) return 0;
-  const titleTrigrams = getTrigrams(titleNorm);
-  let shared = 0;
-  for (const t of queryTrigrams) {
-    if (titleTrigrams.has(t)) shared++;
-  }
-  return shared / queryTrigrams.size;
-}
-
-/**
- * Compute a relevance score for a single result against a parsed query.
- *
- * Scoring tiers:
- *  +100 exact title match
- *  +60  title starts with full query
- *  0–50 word overlap (prefix matching)
- *  0–30 trigram similarity (handles typos)
- *  +20  year hint exact match
- *  +10  year hint within ±1
- *  0–10 title brevity bonus (shorter titles that still match score slightly higher)
- */
-export function computeRelevanceScore(
-  result: NormalizedResult,
-  cleanQuery: string,
-  queryWords: string[],
-  yearHint: number | null
-): number {
-  const titleNorm = result.title.toLowerCase().trim();
+function calculateRelevanceScore(result: NormalizedResult, query: string): number {
+  const normalizedTitle = result.title.toLowerCase().trim();
+  const normalizedQuery = query.toLowerCase().trim();
   let score = 0;
 
-  if (titleNorm === cleanQuery) {
+  // Exact title match (highest priority)
+  if (normalizedTitle === normalizedQuery) {
     score += 100;
-  } else if (titleNorm.startsWith(cleanQuery)) {
+  }
+  // Title starts with query (e.g. "the godfather" matches "The Godfather Part II")
+  else if (normalizedTitle.startsWith(normalizedQuery)) {
+    score += 80;
+  }
+  // Title contains query as a whole phrase
+  else if (normalizedTitle.includes(normalizedQuery)) {
     score += 60;
   }
-
-  score += wordOverlapScore(queryWords, titleNorm) * 50;
-  score += trigramSimilarityScore(cleanQuery, titleNorm) * 30;
-
-  if (yearHint !== null && result.year !== null) {
-    if (result.year === yearHint) {
-      score += 20;
-    } else if (Math.abs(result.year - yearHint) === 1) {
-      score += 10;
-    }
+  // Query starts with title (e.g. query "the godfather 1972" matches "The Godfather")
+  else if (normalizedQuery.startsWith(normalizedTitle)) {
+    score += 70;
   }
 
-  // Brevity bonus: shorter titles score higher when query words match well.
-  // This helps "Interstellar" beat "Interstellar Interference" for query "interst".
-  // Max +10, proportional to how close the title length is to the query length.
-  if (titleNorm.length > 0 && cleanQuery.length > 0) {
-    const lengthRatio =
-      Math.min(cleanQuery.length, titleNorm.length) / Math.max(cleanQuery.length, titleNorm.length);
-    score += lengthRatio * 10;
+  // Bonus for similar length (penalise titles much longer than the query)
+  const lengthRatio = normalizedQuery.length / normalizedTitle.length;
+  if (lengthRatio > 0.5 && lengthRatio <= 1) {
+    score += 20 * lengthRatio;
+  }
+
+  // Small bonus for having a year (indicates a real, well-known title)
+  if (result.year) {
+    score += 5;
   }
 
   return score;
 }
 
 /**
- * Rank results by relevance score descending, with year as tie-break.
- * Falls back to year-desc sort when mode is 'year-desc'.
+ * Sort results by relevance to the search query, with year as tiebreaker.
  */
-export function rankResults(
-  results: NormalizedResult[],
-  query: string,
-  mode: SortMode
-): NormalizedResult[] {
-  if (mode === 'year-desc') {
-    return sortResultsByYear(results);
-  }
-
-  const { cleanQuery, yearHint } = extractYearHint(query);
-  const queryWords = cleanQuery.split(/\s+/).filter((w) => w.length > 0);
-
+export function sortResultsByRelevance(results: NormalizedResult[], query: string): NormalizedResult[] {
   return [...results].sort((a, b) => {
-    const scoreA = computeRelevanceScore(a, cleanQuery, queryWords, yearHint);
-    const scoreB = computeRelevanceScore(b, cleanQuery, queryWords, yearHint);
-    if (scoreB !== scoreA) return scoreB - scoreA;
-    // Tie-break: newer first
-    return (b.year || 0) - (a.year || 0);
+    const scoreA = calculateRelevanceScore(a, query);
+    const scoreB = calculateRelevanceScore(b, query);
+
+    // Primary sort: relevance score (higher first)
+    if (scoreB !== scoreA) {
+      return scoreB - scoreA;
+    }
+
+    // Tiebreaker: year descending (newer first)
+    const yearA = a.year || 0;
+    const yearB = b.year || 0;
+    return yearB - yearA;
   });
 }
 

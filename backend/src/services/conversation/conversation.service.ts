@@ -18,7 +18,6 @@ import { encryptionService } from '../encryption/encryption.service.js';
 import { mediaSearchService } from '../media-search/media-search.service.js';
 import { mediaServiceConfigRepository } from '../../repositories/media-service-config.repository.js';
 import { requestApprovalService } from './request-approval.service.js';
-import { settingRepository } from '../../repositories/setting.repository.js';
 
 /**
  * Conversation service response
@@ -41,57 +40,21 @@ export class ConversationService {
   // Store active contact names for async callbacks (sessionId -> contactName)
   private activeContactNames = new Map<string, string>();
 
-  // Session expiry: 24 hours so users can reply at their leisure
-  private readonly SESSION_EXPIRY_MINUTES = 24 * 60;
-
-  /**
-   * Resolve a full poster URL from a NormalizedResult
-   */
-  private resolvePosterUrl(result: NormalizedResult): string | null {
-    if (!result.posterPath) return null;
-    if (result.posterPath.startsWith('http')) {
-      return result.posterPath;
-    }
-    // TMDB path from Seerr
-    return `https://image.tmdb.org/t/p/w500${result.posterPath}`;
-  }
-
-  /**
-   * Process an incoming message from a user
-   * @param phoneNumberHash - Hash of the phone number/identifier for session lookup
-   * @param message - The message text
-   * @param replyJid - Full JID to use for sending responses (preserves @lid or @s.whatsapp.net)
-   * @param contactName - Contact display name
-   * @param phoneNumber - Actual phone number for storage (optional, may not be available with LID)
-   */
-  /**
-   * Merge an LID-only contact into its resolved phone-number contact so a single
-   * identity is preserved (no duplicate rows). Re-points dependent rows
-   * (request history, conversation sessions, broadcast recipients) from the LID
-   * contact to the PN contact, then deletes the now-empty LID contact.
-   *
-   * The LID contact is looked up by its LID hash (phoneNumberHash), not by
-   * replyJid — LID contacts are often stored without a replyJid, so the hash is
-   * the reliable link between the LID identity and its resolved phone number.
-   */
   async mergeLidContact(lidHash: string, pn: string, pnHash: string): Promise<void> {
     const lidContact = await contactRepository.findByPhoneHash(lidHash);
     if (!lidContact) return;
 
     const pnContact = await contactRepository.findByPhoneHash(pnHash);
     if (!pnContact) {
-      // No PN contact yet — re-key the LID contact to the PN hash in place.
-      const encrypted = encryptionService.encrypt(pn);
       await contactRepository.rekeyToPn(
         lidContact.phoneNumberHash,
         pnHash,
-        encrypted,
+        encryptionService.encrypt(pn),
         `${pn}@s.whatsapp.net`
       );
       return;
     }
 
-    // PN contact exists: repoint dependents, then drop the LID row.
     await requestHistoryRepository.repointByPhoneHash(lidContact.phoneNumberHash, pnHash);
     await conversationSessionRepository.repointByPhoneHash(lidContact.phoneNumberHash, pnHash);
     await broadcastRepository.repointRecipientsByContactId(
@@ -103,6 +66,14 @@ export class ConversationService {
     await contactRepository.delete(lidContact.id);
   }
 
+  /**
+   * Process an incoming message from a user
+   * @param phoneNumberHash - Hash of the phone number/identifier for session lookup
+   * @param message - The message text
+   * @param replyJid - Full JID to use for sending responses (preserves @lid or @s.whatsapp.net)
+   * @param contactName - Contact display name
+   * @param phoneNumber - Actual phone number for storage (optional, may not be available with LID)
+   */
   async processMessage(
     phoneNumberHash: string,
     message: string,
@@ -124,7 +95,7 @@ export class ConversationService {
         id: generateSessionId(),
         phoneNumberHash,
         state: 'IDLE',
-        expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
+        expiresAt: getExpirationTime(5),
         contactName: contactName || undefined,
       });
       logger.info(
@@ -136,16 +107,10 @@ export class ConversationService {
       if (contactName) {
         try {
           // Persist the contact name and backfill historical request entries so older requests show a name.
-          // Phone number may be null for LID users; only encrypt if available.
           const phoneNumberEncrypted = phoneNumber
             ? encryptionService.encrypt(phoneNumber)
             : undefined;
-          await contactRepository.upsert({
-            phoneNumberHash,
-            contactName,
-            phoneNumberEncrypted,
-            replyJid: replyJid ?? undefined,
-          });
+          await contactRepository.upsert({ phoneNumberHash, contactName, phoneNumberEncrypted });
           // Backfill contact name to existing request_history entries
           await requestHistoryRepository.updateContactNameForPhone(
             phoneNumberHash,
@@ -176,16 +141,10 @@ export class ConversationService {
 
         try {
           // Upsert to contacts list and backfill historical request entries.
-          // Phone number may be null for LID users; only encrypt if available.
           const phoneNumberEncrypted = phoneNumber
             ? encryptionService.encrypt(phoneNumber)
             : undefined;
-          await contactRepository.upsert({
-            phoneNumberHash,
-            contactName,
-            phoneNumberEncrypted,
-            replyJid: replyJid ?? undefined,
-          });
+          await contactRepository.upsert({ phoneNumberHash, contactName, phoneNumberEncrypted });
           // Backfill contact name to existing request_history entries
           await requestHistoryRepository.updateContactNameForPhone(
             phoneNumberHash,
@@ -206,38 +165,6 @@ export class ConversationService {
         }
       } else {
         logger.warn({ sessionId: session.id }, 'Failed to update contact name for session');
-      }
-    } else if (phoneNumber) {
-      // We have a resolved phone number — make sure a contact exists with it.
-      try {
-        const existingContact = await contactRepository.findByPhoneHash(phoneNumberHash);
-        if (!existingContact) {
-          // No contact yet (e.g. deleted, or first LID message without a push name) — create it.
-          await contactRepository.upsert({
-            phoneNumberHash,
-            contactName: contactName || null,
-            phoneNumberEncrypted: encryptionService.encrypt(phoneNumber),
-            replyJid: replyJid ?? undefined,
-          });
-          logger.info({ phoneNumberHash, contactName }, 'Created contact with phone number');
-        } else if (!existingContact.phoneNumberEncrypted) {
-          // Existing contact missing a phone number — backfill it.
-          await contactRepository.upsert({
-            phoneNumberHash,
-            contactName: existingContact.contactName || contactName,
-            phoneNumberEncrypted: encryptionService.encrypt(phoneNumber),
-            replyJid: replyJid ?? undefined,
-          });
-          logger.info(
-            { phoneNumberHash, contactId: existingContact.id },
-            'Updated contact with phone number'
-          );
-        }
-      } catch (err) {
-        logger.warn(
-          { sessionId: session.id, phoneNumberHash, error: err },
-          'Failed to backfill contact phone number'
-        );
       }
     }
 
@@ -301,24 +228,16 @@ export class ConversationService {
       return this.handleCancel(session);
     }
 
-    // Allow starting a new search from any interactive state
-    if (
-      intent.intent === 'media_request' &&
-      currentState !== 'IDLE' &&
-      currentState !== 'PROCESSING'
-    ) {
-      logger.info(
-        { sessionId: session.id, currentState, query: intent.query },
-        '🔍 DEBUG: Starting new search from interactive state, resetting session'
-      );
-      const resetSession = await this.resetSessionForNewSearch(session);
-      return this.handleIdleState(resetSession, intent);
-    }
-
     // Handle based on current state
     switch (currentState) {
       case 'IDLE':
         logger.info({ sessionId: session.id }, '🔍 DEBUG: Calling handleIdleState');
+        return this.handleIdleState(session, intent);
+
+      case 'AWAITING_INPUT':
+        // User sent the prefix command, now waiting for their actual search query
+        // Treat this the same as IDLE - parse their message as a media request
+        logger.info({ sessionId: session.id }, '🔍 DEBUG: AWAITING_INPUT, treating as IDLE');
         return this.handleIdleState(session, intent);
 
       case 'SEARCHING':
@@ -364,13 +283,19 @@ export class ConversationService {
     intent: IntentResult
   ): Promise<ConversationResponse> {
     if (intent.intent !== 'media_request' || !intent.query || !intent.mediaType) {
+      // Set state to AWAITING_INPUT so follow-up messages bypass the prefix filter
+      await conversationSessionRepository.update(session.id, {
+        state: 'AWAITING_INPUT',
+      });
+
       return this.createResponse(
         session,
         'I can help you find movies and TV series! Try saying something like:\n\n' +
           '🎬 "I want to watch Inception"\n' +
           '📺 "Find Breaking Bad series"\n' +
-          '🎬 "Search for The Matrix"',
-        'IDLE'
+          '🎬 "Search for The Matrix"\n' +
+          '🔗 Or paste an IMDb link!',
+        'AWAITING_INPUT'
       );
     }
 
@@ -396,33 +321,24 @@ export class ConversationService {
       state: 'SEARCHING',
       mediaType: intent.mediaType,
       searchQuery: intent.query,
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
     });
 
-    // Trigger media search asynchronously — but first send the "searching" ack
-    // directly here so it's guaranteed to be dispatched before search results arrive.
-    // (The caller also returns this message and sends it, but race conditions between
-    // fast cached searches and WhatsApp message delivery mean results can arrive first.)
-    const replyJid = this.activeReplyJids.get(session.id);
-    if (replyJid) {
-      try {
-        const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
-        await whatsappClientService.sendMessage(
-          replyJid,
-          `🔍 Searching for: "${intent.query}"...\n\nPlease wait...`
-        );
-      } catch (sendErr) {
-        logger.warn({ sessionId: session.id, error: sendErr }, 'Failed to send search ack');
-      }
-    }
+    // Trigger media search asynchronously
+    logger.info(
+      { sessionId: session.id, mediaType: intent.mediaType, query: intent.query },
+      'Started media search'
+    );
 
-    // Perform search in background — results sent directly to user from performSearch()
+    // Perform search in background and handle completion
     this.performSearch(session.id, intent.mediaType, intent.query).catch((error) => {
       logger.error({ sessionId: session.id, error }, 'Media search failed');
     });
 
-    // Return empty message — the ack was already sent above, don't double-send
-    return this.createResponse(session, '', 'SEARCHING');
+    const searchMessage = intent.imdbId
+      ? `🔗 Looking up IMDb title ${intent.imdbId}...\n\nPlease wait...`
+      : `🔍 Searching for: "${intent.query}"...\n\nPlease wait...`;
+
+    return this.createResponse(session, searchMessage, 'SEARCHING');
   }
 
   /**
@@ -453,32 +369,21 @@ export class ConversationService {
       // Handle search completion
       const response = await this.handleSearchComplete(sessionId, searchResult.results);
 
-      if (!response) {
-        // null means the session was no longer in SEARCHING state — most likely the user
-        // cancelled mid-search. Silently discard; no error message needed.
-        logger.info(
-          { sessionId, query },
-          'handleSearchComplete returned null — session was cancelled or state changed, discarding results'
-        );
-        return;
-      }
+      if (response) {
+        // Get reply JID for this session (for sending messages)
+        const replyJid = this.activeReplyJids.get(sessionId);
 
-      // Get reply JID for this session (for sending messages)
-      const replyJid = this.activeReplyJids.get(sessionId);
+        if (replyJid) {
+          // Import whatsappClientService dynamically to avoid circular dependency
+          const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
 
-      if (replyJid) {
-        // Import whatsappClientService dynamically to avoid circular dependency
-        const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
+          // Send search results to user
+          await whatsappClientService.sendMessage(replyJid, response.message);
 
-        // Send search results to user
-        await whatsappClientService.sendMessage(replyJid, response.message);
-
-        logger.info({ sessionId, replyJid: replyJid.slice(-4) }, 'Search results sent to user');
-      } else {
-        logger.error(
-          { sessionId, query },
-          'Reply JID not found for session — search results cannot be sent to user'
-        );
+          logger.info({ sessionId, replyJid: replyJid.slice(-4) }, 'Search results sent to user');
+        } else {
+          logger.warn({ sessionId }, 'Reply JID not found for session - cannot send results');
+        }
       }
     } catch (error) {
       logger.error({ sessionId, error }, 'Error performing media search');
@@ -486,12 +391,11 @@ export class ConversationService {
       // Get reply JID for error notification
       const replyJid = this.activeReplyJids.get(sessionId);
 
-      // Update session to IDLE and mark as failed
-      this.cleanupSessionMaps(sessionId);
-      await conversationSessionRepository.update(sessionId, {
-        state: 'IDLE',
-        searchResults: [],
-      });
+      // Delete session so normal chat resumes after search failure
+      await conversationSessionRepository.delete(sessionId);
+      this.activeReplyJids.delete(sessionId);
+      this.activePhoneNumbers.delete(sessionId);
+      this.activeContactNames.delete(sessionId);
 
       // Notify user of search failure
       if (replyJid) {
@@ -544,32 +448,15 @@ export class ConversationService {
     // Get selected result (convert to 0-indexed)
     const selectedResult = results[selectionNumber - 1];
 
-    // Block requests for media that Overseerr already knows about (status >= 2).
-    // 2=pending, 3=processing, 4=partially_available, 5=available
-    if (selectedResult.mediaStatus !== undefined && selectedResult.mediaStatus >= 2) {
-      const emoji = selectedResult.mediaType === 'movie' ? '🎬' : '📺';
-      const yearStr = selectedResult.year ? ` (${selectedResult.year})` : '';
-      const statusMessages: Record<number, string> = {
-        2: `⏳ *${selectedResult.title}${yearStr}* has already been requested and is pending approval.`,
-        3: `⚙️ *${selectedResult.title}${yearStr}* is already being processed/downloaded.`,
-        4: `✅ *${selectedResult.title}${yearStr}* is partially available — some content can already be watched!`,
-        5: `✅ *${selectedResult.title}${yearStr}* is already available in the library. You can watch it now!`,
-      };
-      const msg =
-        statusMessages[selectedResult.mediaStatus] ??
-        `ℹ️ ${emoji} *${selectedResult.title}${yearStr}* is already in the system.`;
-      return this.createResponse(session, msg, 'AWAITING_SELECTION');
-    }
-
     // Check if this is a TV series - if so, fetch season details and ask for season selection
     if (selectedResult.mediaType === 'series' && selectedResult.tmdbId) {
       try {
-        // Get Seerr service configuration
-        const overseerrConfigs = await mediaServiceConfigRepository.findByType('seerr');
+        // Get Overseerr service configuration
+        const overseerrConfigs = await mediaServiceConfigRepository.findByType('overseerr');
         const overseerrConfig = overseerrConfigs.find((c) => c.enabled);
 
         if (overseerrConfig && overseerrConfig.apiKeyEncrypted) {
-          // Fetch TV details including season information from Seerr
+          // Fetch TV details including season information from Overseerr
           const { OverseerrClient } = await import('../integrations/overseerr.client.js');
           const { encryptionService } = await import('../encryption/encryption.service.js');
 
@@ -634,7 +521,6 @@ export class ConversationService {
                 selectedResultIndex: selectionNumber - 1,
                 selectedResult,
                 availableSeasons: regularSeasons,
-                expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
               });
 
               // Generate season selection message
@@ -698,7 +584,6 @@ export class ConversationService {
       state: 'AWAITING_CONFIRMATION',
       selectedResultIndex: selectionNumber - 1,
       selectedResult,
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
     });
 
     // Generate confirmation message
@@ -713,47 +598,6 @@ export class ConversationService {
       `*${selectedResult.title}${yearStr}*${seasonInfo}\n\n` +
       `${selectedResult.overview || 'No description available.'}\n\n` +
       `Reply *YES* to confirm or *NO* to cancel.`;
-
-    // Send poster image if enabled and available
-    const replyJid = this.activeReplyJids.get(session.id);
-    if (replyJid) {
-      try {
-        const sendPostersSetting = await settingRepository.findByKey('sendPosters');
-        const sendPosters = sendPostersSetting?.value !== false; // default true
-
-        if (sendPosters) {
-          const posterUrl = this.resolvePosterUrl(selectedResult);
-          if (posterUrl) {
-            const response = await fetch(posterUrl, { signal: AbortSignal.timeout(5000) });
-            if (response.ok) {
-              const imageBuffer = Buffer.from(await response.arrayBuffer());
-
-              const { whatsappClientService } = await import(
-                '../whatsapp/whatsapp-client.service.js'
-              );
-
-              const viewOnceSetting = await settingRepository.findByKey('sendPostersViewOnce');
-              const viewOnce = viewOnceSetting?.value === true;
-
-              await whatsappClientService.sendImage(
-                replyJid,
-                imageBuffer,
-                confirmationMessage,
-                viewOnce
-              );
-
-              // Return empty message to prevent duplicate text send
-              return this.createResponse(session, '', 'AWAITING_CONFIRMATION');
-            }
-          }
-        }
-      } catch (error) {
-        logger.warn(
-          { sessionId: session.id, error, posterUrl: this.resolvePosterUrl(selectedResult) },
-          'Failed to send poster image, falling back to text'
-        );
-      }
-    }
 
     return this.createResponse(session, confirmationMessage, 'AWAITING_CONFIRMATION');
   }
@@ -821,7 +665,6 @@ export class ConversationService {
       state: 'AWAITING_CONFIRMATION',
       selectedSeasons:
         intent.seasons === 'all' ? availableSeasons.map((s) => s.seasonNumber) : intent.seasons,
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
     });
 
     // Generate confirmation message
@@ -852,47 +695,6 @@ export class ConversationService {
       `${selectedResult.overview || 'No description available.'}\n\n` +
       `Reply *YES* to confirm or *NO* to cancel.`;
 
-    // Send poster image if enabled and available
-    const replyJid = this.activeReplyJids.get(session.id);
-    if (replyJid) {
-      try {
-        const sendPostersSetting = await settingRepository.findByKey('sendPosters');
-        const sendPosters = sendPostersSetting?.value !== false; // default true
-
-        if (sendPosters) {
-          const posterUrl = this.resolvePosterUrl(selectedResult);
-          if (posterUrl) {
-            const response = await fetch(posterUrl, { signal: AbortSignal.timeout(5000) });
-            if (response.ok) {
-              const imageBuffer = Buffer.from(await response.arrayBuffer());
-
-              const { whatsappClientService } = await import(
-                '../whatsapp/whatsapp-client.service.js'
-              );
-
-              const viewOnceSetting = await settingRepository.findByKey('sendPostersViewOnce');
-              const viewOnce = viewOnceSetting?.value === true;
-
-              await whatsappClientService.sendImage(
-                replyJid,
-                imageBuffer,
-                confirmationMessage,
-                viewOnce
-              );
-
-              // Return empty message to prevent duplicate text send
-              return this.createResponse(session, '', 'AWAITING_CONFIRMATION');
-            }
-          }
-        }
-      } catch (error) {
-        logger.warn(
-          { sessionId: session.id, error, posterUrl: this.resolvePosterUrl(selectedResult) },
-          'Failed to send poster image, falling back to text'
-        );
-      }
-    }
-
     return this.createResponse(session, confirmationMessage, 'AWAITING_CONFIRMATION');
   }
 
@@ -916,21 +718,6 @@ export class ConversationService {
       return this.handleCancel(session);
     }
 
-    // Pre-check quota before transitioning to PROCESSING — avoids sending ⏳ then a
-    // rejection 8ms later (two rapid sends to the same @lid JID causes the second to drop).
-    const { quotaCheckService, formatQuotaWindow } = await import('./quota-check.service.js');
-    const quotaCheck = await quotaCheckService.checkQuota(session.phoneNumberHash);
-    if (!quotaCheck.allowed) {
-      const msg =
-        quotaCheck.max === 0
-          ? `❌ Requests are not allowed for your account.\n\nPlease contact the administrator.`
-          : `❌ Request limit reached\n\n` +
-            `You've used ${quotaCheck.used}/${quotaCheck.max} requests ${formatQuotaWindow(quotaCheck.windowType)}.\n` +
-            `Your quota resets ${quotaCheck.resetTime}.\n\n` +
-            `Try again then!`;
-      return this.createResponse(session, msg, 'AWAITING_CONFIRMATION');
-    }
-
     // User confirmed - transition to PROCESSING
     const action: StateMachineAction = { type: 'CONFIRM' };
     const transitionResult = stateMachine.processAction(session.state, action);
@@ -950,7 +737,6 @@ export class ConversationService {
     // Update session to PROCESSING
     await conversationSessionRepository.update(session.id, {
       state: 'PROCESSING',
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
     });
 
     // Get auto-approval mode to determine the response message
@@ -965,11 +751,15 @@ export class ConversationService {
       logger.error({ sessionId: session.id, error }, 'Failed to submit request');
     });
 
-    // Send a generic processing message. The actual result (submitted/pending/rejected)
-    // will be communicated by the request approval service asynchronously.
+    // For auto-deny mode, don't send "Submitting" message - the rejection message will come from request approval service
+    // For auto-approve and manual modes, send the "Submitting" message
+    if (autoApprovalMode === 'auto_deny') {
+      return this.createResponse(session, '⏳ Processing your request...', 'PROCESSING');
+    }
+
     return this.createResponse(
       session,
-      '⏳ Processing your request...\n\nPlease wait...',
+      '⏳ Submitting your request...\n\nPlease wait while I add this to your library.',
       'PROCESSING'
     );
   }
@@ -986,16 +776,15 @@ export class ConversationService {
       );
     }
 
-    // Reset to IDLE
-    this.cleanupSessionMaps(session.id);
-    await conversationSessionRepository.update(session.id, {
-      state: 'IDLE',
-      mediaType: null,
-      searchQuery: null,
-      searchResults: null,
-      selectedResultIndex: null,
-      selectedResult: null,
-    });
+    // Delete session so user's normal messages are no longer intercepted
+    await conversationSessionRepository.delete(session.id);
+
+    // Clean up in-memory maps
+    this.activeReplyJids.delete(session.id);
+    this.activePhoneNumbers.delete(session.id);
+    this.activeContactNames.delete(session.id);
+
+    logger.info({ sessionId: session.id }, 'Session deleted after cancellation');
 
     return this.createResponse(
       session,
@@ -1011,15 +800,13 @@ export class ConversationService {
     session: ConversationSessionModel,
     message: string
   ): Promise<ConversationResponse> {
-    this.cleanupSessionMaps(session.id);
-    await conversationSessionRepository.update(session.id, {
-      state: 'IDLE',
-      mediaType: null,
-      searchQuery: null,
-      searchResults: null,
-      selectedResultIndex: null,
-      selectedResult: null,
-    });
+    // Delete session so user's normal messages are no longer intercepted
+    await conversationSessionRepository.delete(session.id);
+
+    // Clean up in-memory maps
+    this.activeReplyJids.delete(session.id);
+    this.activePhoneNumbers.delete(session.id);
+    this.activeContactNames.delete(session.id);
 
     return this.createResponse(session, message, 'IDLE');
   }
@@ -1037,44 +824,6 @@ export class ConversationService {
       state,
       sessionId: session.id,
     };
-  }
-
-  /**
-   * Clean up in-memory Maps for a session to prevent memory leaks
-   */
-  private cleanupSessionMaps(sessionId: string): void {
-    this.activeReplyJids.delete(sessionId);
-    this.activePhoneNumbers.delete(sessionId);
-    this.activeContactNames.delete(sessionId);
-  }
-
-  /**
-   * Reset an interactive session so the user can start a fresh search.
-   * Clears all selection/confirmation state from DB and memory.
-   * Preserves activeReplyJids (and activePhoneNumbers/activeContactNames) because
-   * the new search that follows will need them to deliver results.
-   */
-  private async resetSessionForNewSearch(
-    session: ConversationSessionModel
-  ): Promise<ConversationSessionModel> {
-    // Do NOT call cleanupSessionMaps() here — the subsequent search
-    // needs activeReplyJids/activePhoneNumbers/activeContactNames
-    // to deliver results to the user. Only clear the DB state.
-
-    const updated = await conversationSessionRepository.update(session.id, {
-      state: 'IDLE',
-      mediaType: null,
-      searchQuery: null,
-      searchResults: null,
-      selectedResultIndex: null,
-      selectedResult: null,
-      availableSeasons: null,
-      selectedSeasons: null,
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
-    });
-
-    logger.info({ sessionId: session.id }, 'Reset session for new search');
-    return updated || session;
   }
 
   /**
@@ -1099,15 +848,15 @@ export class ConversationService {
       return null;
     }
 
-    // If no results, return to IDLE
+    // If no results, delete session so normal chat resumes
     if (results.length === 0) {
       const action: StateMachineAction = { type: 'SEARCH_FAILED' };
       stateMachine.processAction(session.state, action);
 
-      await conversationSessionRepository.update(sessionId, {
-        state: 'IDLE',
-        searchResults: [],
-      });
+      await conversationSessionRepository.delete(sessionId);
+      this.activeReplyJids.delete(sessionId);
+      this.activePhoneNumbers.delete(sessionId);
+      this.activeContactNames.delete(sessionId);
 
       return this.createResponse(
         session,
@@ -1132,8 +881,19 @@ export class ConversationService {
     await conversationSessionRepository.update(sessionId, {
       state: 'AWAITING_SELECTION',
       searchResults: results,
-      expiresAt: getExpirationTime(this.SESSION_EXPIRY_MINUTES),
     });
+
+    // Auto-select for IMDb lookup with exactly 1 result (skip selection step)
+    if (session.searchQuery?.startsWith('imdb:') && results.length === 1) {
+      logger.info({ sessionId }, 'IMDb lookup returned single result - auto-selecting');
+
+      // Re-fetch the updated session (with searchResults populated)
+      const updatedSession = await conversationSessionRepository.findById(sessionId);
+      if (updatedSession) {
+        const autoSelectIntent: IntentResult = { intent: 'selection', selectionNumber: 1 };
+        return this.handleAwaitingSelection(updatedSession, autoSelectIntent);
+      }
+    }
 
     // Format results for display
     const resultsList = results
@@ -1189,10 +949,16 @@ export class ConversationService {
 
     stateMachine.processAction(session.state, action);
 
-    this.cleanupSessionMaps(sessionId);
-    await conversationSessionRepository.update(sessionId, {
-      state: 'IDLE',
-    });
+    // Delete the session entirely so the user's normal messages
+    // are no longer intercepted by the prefix filter bypass
+    await conversationSessionRepository.delete(sessionId);
+
+    // Clean up in-memory maps
+    this.activeReplyJids.delete(sessionId);
+    this.activePhoneNumbers.delete(sessionId);
+    this.activeContactNames.delete(sessionId);
+
+    logger.info({ sessionId }, 'Session deleted after request completion');
 
     if (success && session.selectedResult) {
       const emoji = session.selectedResult.mediaType === 'movie' ? '🎬' : '📺';
@@ -1221,16 +987,7 @@ export class ConversationService {
 
       if (!session || !session.selectedResult) {
         logger.error({ sessionId }, 'Session or selected result not found for submission');
-        const errResponse = await this.handleSubmissionComplete(
-          sessionId,
-          false,
-          'Session not found'
-        );
-        const replyJid = this.activeReplyJids.get(sessionId);
-        if (errResponse?.message && replyJid) {
-          const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
-          await whatsappClientService.sendMessage(replyJid, errResponse.message).catch(() => {});
-        }
+        await this.handleSubmissionComplete(sessionId, false, 'Session not found');
         return;
       }
 
@@ -1244,33 +1001,27 @@ export class ConversationService {
 
       if (enabledServices.length === 0) {
         logger.error({ sessionId }, 'No enabled services found');
-        const errResponse = await this.handleSubmissionComplete(
-          sessionId,
-          false,
-          'No services configured'
-        );
-        const replyJid = this.activeReplyJids.get(sessionId);
-        if (errResponse?.message && replyJid) {
-          const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
-          await whatsappClientService.sendMessage(replyJid, errResponse.message).catch(() => {});
-        }
+        await this.handleSubmissionComplete(sessionId, false, 'No services configured');
         return;
       }
 
-      // Select the most appropriate service for the media type.
-      // Prefer a type-specific service (radarr for movies, sonarr for series),
-      // then fall back to seerr, then the highest-priority service.
-      const mediaType = selectedResult.mediaType;
-      const preferredServiceType = mediaType === 'movie' ? 'radarr' : 'sonarr';
-
-      let service =
-        enabledServices.find((s) => s.serviceType === preferredServiceType) ??
-        enabledServices.find((s) => s.serviceType === 'seerr') ??
+      // Select the correct service based on media type:
+      // - Movies → radarr first, then overseerr
+      // - Series → sonarr first, then overseerr
+      const preferredType = selectedResult.mediaType === 'movie' ? 'radarr' : 'sonarr';
+      const service =
+        enabledServices.find((s) => s.serviceType === preferredType) ||
+        enabledServices.find((s) => s.serviceType === 'overseerr') ||
         enabledServices[0];
 
       logger.info(
-        { sessionId, mediaType, selectedServiceType: service.serviceType, serviceId: service.id },
-        'Selected service for media request'
+        {
+          sessionId,
+          mediaType: selectedResult.mediaType,
+          selectedService: service.serviceType,
+          serviceName: service.name,
+        },
+        'Selected service for submission based on media type'
       );
 
       // Get phone number and contact name for this session
@@ -1284,44 +1035,28 @@ export class ConversationService {
         selectedResult,
         service.id,
         session.selectedSeasons ?? undefined,
-        contactName,
-        this.activeReplyJids.get(sessionId)
+        contactName
       );
+
+      // Note: The request approval service already sends WhatsApp notifications to the user,
+      // so we don't need to send duplicate messages here. Only send a message if the
+      // request approval service didn't send one (which shouldn't happen in normal flow).
 
       logger.info(
         {
           sessionId,
           status: result.status,
           phoneNumber: phoneNumber ? phoneNumber.slice(-4) : 'unknown',
-          replyJid: this.activeReplyJids.get(sessionId)?.slice(-8),
         },
         'Request processing completed'
       );
 
-      const isSuccess = result.status === 'SUBMITTED' || result.status === 'PENDING';
-
-      // Capture replyJid BEFORE handleSubmissionComplete clears session maps
-      const replyJid = this.activeReplyJids.get(sessionId);
-
       // Handle completion - transition back to IDLE
-      const response = await this.handleSubmissionComplete(
+      await this.handleSubmissionComplete(
         sessionId,
-        isSuccess,
+        result.status === 'SUBMITTED' || result.status === 'PENDING',
         result.errorMessage
       );
-
-      // Send confirmation message to the user.
-      // For quota rejections, createAndProcessRequest already sent the detailed message,
-      // so only send for successful submissions (PENDING/SUBMITTED).
-      // For REJECTED status, skip to avoid duplicating the quota rejection message.
-      if (isSuccess && response?.message && replyJid) {
-        try {
-          const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
-          await whatsappClientService.sendMessage(replyJid, response.message);
-        } catch (sendError) {
-          logger.error({ sessionId, error: sendError }, 'Failed to send success message');
-        }
-      }
     } catch (error) {
       logger.error({ sessionId, error }, 'Fatal error in submitRequest');
 

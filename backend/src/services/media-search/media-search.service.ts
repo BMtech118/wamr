@@ -6,7 +6,7 @@
  */
 
 import { logger } from '../../config/logger';
-import type { MediaType, NormalizedResult, SortMode } from '../../types/media-result.types';
+import type { MediaType, NormalizedResult } from '../../types/media-result.types';
 import { mediaServiceConfigRepository } from '../../repositories/media-service-config.repository';
 import { encryptionService } from '../encryption/encryption.service';
 import { RadarrClient } from '../integrations/radarr.client';
@@ -14,7 +14,6 @@ import { SonarrClient } from '../integrations/sonarr.client';
 import { OverseerrClient } from '../integrations/overseerr.client';
 import { resultNormalizerService } from './result-normalizer';
 import { cacheService, type CacheStats } from './cache.service';
-import { settingRepository } from '../../repositories/setting.repository';
 
 /**
  * Search result with service information
@@ -86,26 +85,31 @@ class MediaSearchService {
 
     // Determine which services to search
     let servicesToSearch: string[];
-    if (searchBoth) {
+    const isImdbLookup = query.startsWith('imdb:');
+
+    if (isImdbLookup) {
+      // IMDb ID lookups: only Radarr and Sonarr support the imdb: term syntax
+      servicesToSearch = ['radarr', 'sonarr'];
+      logger.info('Starting IMDb ID lookup (Radarr + Sonarr only)', {
+        query,
+        services: servicesToSearch,
+      });
+    } else if (searchBoth) {
       // Search all services when ambiguous
-      servicesToSearch = ['radarr', 'sonarr', 'seerr'];
+      servicesToSearch = ['radarr', 'sonarr', 'overseerr'];
       logger.info('Starting comprehensive media search (movies + series)', {
         query,
         services: servicesToSearch,
       });
     } else {
       // Search specific services based on media type
-      servicesToSearch = mediaType === 'movie' ? ['radarr', 'seerr'] : ['sonarr', 'seerr'];
+      servicesToSearch = mediaType === 'movie' ? ['radarr', 'overseerr'] : ['sonarr', 'overseerr'];
       logger.info('Starting media search', {
         mediaType,
         query,
         services: servicesToSearch,
       });
     }
-
-    // Read sort mode from settings (default to 'relevance')
-    const sortModeSetting = await settingRepository.findByKey('search.sortMode');
-    const sortMode: SortMode = sortModeSetting?.value === 'year-desc' ? 'year-desc' : 'relevance';
 
     // Get maxResults from service configs (use the maximum across all enabled services)
     const allConfigs = await mediaServiceConfigRepository.findAll();
@@ -126,7 +130,11 @@ class MediaSearchService {
 
     // Search all services in parallel with timeout
     const searchPromises = servicesToSearch.map((serviceType) =>
-      this.searchService(serviceType as 'radarr' | 'sonarr' | 'seerr', query, effectiveMediaType)
+      this.searchService(
+        serviceType as 'radarr' | 'sonarr' | 'overseerr',
+        query,
+        effectiveMediaType
+      )
     );
 
     const results = await Promise.allSettled(searchPromises);
@@ -141,35 +149,32 @@ class MediaSearchService {
     results.forEach((result, index) => {
       const serviceType = servicesToSearch[index];
 
-      if (result.status === 'fulfilled' && result.value !== null) {
+      if (result.status === 'fulfilled' && result.value) {
         searchedServices.push(serviceType);
 
         if (serviceType === 'radarr') {
           radarrResults = result.value;
         } else if (serviceType === 'sonarr') {
           sonarrResults = result.value;
-        } else if (serviceType === 'seerr') {
-          // Merge seerr results (same shape as Overseerr API)
-          overseerrResults = [...overseerrResults, ...result.value];
+        } else if (serviceType === 'overseerr') {
+          overseerrResults = result.value;
         }
-      } else if (result.status === 'rejected') {
+      } else {
         failedServices.push(serviceType);
         logger.warn('Service search failed', {
           service: serviceType,
-          error: result.reason,
+          error: result.status === 'rejected' ? result.reason : 'Unknown error',
         });
       }
-      // result.value === null means service not configured — skip silently
     });
 
-    // Normalize and combine results
+    // Normalize and combine results (pass query for relevance sorting)
     const normalizedResults = resultNormalizerService.combineAndProcess(
       radarrResults,
       sonarrResults,
       overseerrResults,
       maxResults, // Use dynamic limit from service config
-      query,
-      sortMode
+      query
     );
 
     // Cache results for 5 minutes
@@ -201,17 +206,17 @@ class MediaSearchService {
    * Search a specific service with timeout
    */
   private async searchService(
-    serviceType: 'radarr' | 'sonarr' | 'seerr',
+    serviceType: 'radarr' | 'sonarr' | 'overseerr',
     query: string,
     mediaType: MediaType
-  ): Promise<any[] | null> {
+  ): Promise<any[]> {
     try {
       // Get enabled services of this type, ordered by priority
       const configs = await mediaServiceConfigRepository.findEnabledByType(serviceType);
 
       if (configs.length === 0) {
         logger.debug('No enabled services found', { serviceType });
-        return null;
+        return [];
       }
 
       // Use highest priority service (first in array)
@@ -287,7 +292,7 @@ class MediaSearchService {
    * Execute search against specific service client
    */
   private async executeSearch(
-    serviceType: 'radarr' | 'sonarr' | 'seerr',
+    serviceType: 'radarr' | 'sonarr' | 'overseerr',
     baseUrl: string,
     apiKey: string,
     query: string,
@@ -304,18 +309,18 @@ class MediaSearchService {
         return await client.searchSeries(query);
       }
 
-      case 'seerr': {
+      case 'overseerr': {
         const client = new OverseerrClient(baseUrl, apiKey);
         const searchResult = await client.search(query);
 
-        logger.debug('Seerr search results before filtering', {
+        logger.debug('Overseerr search results before filtering', {
           query,
           mediaType,
           totalResults: searchResult.results.length,
           resultTypes: searchResult.results.map((r) => r.mediaType),
         });
 
-        // Filter Seerr results by media type
+        // Filter Overseerr results by media type
         const filtered = searchResult.results.filter((result) => {
           if (mediaType === 'movie') {
             return result.mediaType === 'movie';
@@ -327,7 +332,7 @@ class MediaSearchService {
           }
         });
 
-        logger.debug('Seerr search results after filtering', {
+        logger.debug('Overseerr search results after filtering', {
           query,
           mediaType,
           filteredCount: filtered.length,
@@ -349,9 +354,10 @@ class MediaSearchService {
     mediaType: MediaType
   ): Promise<{ serviceType: string; serviceConfigId: number } | null> {
     try {
-      // For movies: check radarr first, then seerr
-      // For series: check sonarr first, then seerr
+      // For movies: check radarr first, then overseerr
+      // For series: check sonarr first, then overseerr
       const primaryService = mediaType === 'movie' ? 'radarr' : 'sonarr';
+      const fallbackService = 'overseerr';
 
       // Check primary service
       const primaryConfigs = await mediaServiceConfigRepository.findEnabledByType(primaryService);
@@ -362,12 +368,13 @@ class MediaSearchService {
         };
       }
 
-      // Fallback to seerr
-      const seerrConfigs = await mediaServiceConfigRepository.findEnabledByType('seerr');
-      if (seerrConfigs.length > 0) {
+      // Fallback to overseerr
+      const overseerrConfigs =
+        await mediaServiceConfigRepository.findEnabledByType(fallbackService);
+      if (overseerrConfigs.length > 0) {
         return {
-          serviceType: 'seerr',
-          serviceConfigId: seerrConfigs[0].id,
+          serviceType: fallbackService,
+          serviceConfigId: overseerrConfigs[0].id,
         };
       }
 

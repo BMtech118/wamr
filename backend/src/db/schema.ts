@@ -65,6 +65,7 @@ export const conversationSessions = sqliteTable(
     state: text('state', {
       enum: [
         'IDLE',
+        'AWAITING_INPUT',
         'SEARCHING',
         'AWAITING_SELECTION',
         'AWAITING_SEASON_SELECTION',
@@ -100,7 +101,7 @@ export const mediaServiceConfigurations = sqliteTable(
   {
     id: integer('id').primaryKey({ autoIncrement: true }),
     serviceType: text('service_type', {
-      enum: ['radarr', 'sonarr', 'seerr'],
+      enum: ['radarr', 'sonarr', 'seerr', 'overseerr'],
     }).notNull(),
     name: text('name').notNull(),
     baseUrl: text('base_url').notNull(),
@@ -148,7 +149,7 @@ export const requestHistory = sqliteTable(
     tmdbId: integer('tmdb_id'),
     tvdbId: integer('tvdb_id'),
     serviceType: text('service_type', {
-      enum: ['radarr', 'sonarr', 'seerr'],
+      enum: ['radarr', 'sonarr', 'seerr', 'overseerr'],
     }),
     serviceConfigId: integer('service_config_id'),
     selectedSeasons: text('selected_seasons', { mode: 'json' }), // JSON array of season numbers for series requests

@@ -23,6 +23,7 @@
     "clean": "rm -rf dist node_modules",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
+    "postinstall": "node scripts/patch-baileys.cjs",
     "db:migrate:run": "node dist/database/migrate.js",
     "db:migrate:phone-hashes": "tsx scripts/migrate-phone-hashes.ts",
     "db:migrate:phone-hashes:run": "node dist/scripts/migrate-phone-hashes.js",
@@ -59,6 +60,7 @@
     "pino-pretty": "^11.0.0",
     "qrcode": "^1.5.4",
     "socket.io": "^4.7.2",
+    "socks-proxy-agent": "^8.0.5",
     "zod": "^3.22.4"
   },
   "devDependencies": {

@@ -17,6 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY package.json package-lock.json* turbo.json ./
 COPY backend/package.json ./backend/
 COPY frontend/package.json ./frontend/
+COPY backend/scripts ./backend/scripts
 
 # Install all dependencies
 RUN npm install
@@ -39,8 +40,9 @@ RUN npm install && npm run build
 # Build frontend
 WORKDIR /app/frontend
 RUN rm -rf node_modules package-lock.json \
-  && npm install --legacy-peer-deps
-ARG VITE_API_URL=/api
+  && npm install --legacy-peer-deps \
+  && npm install @rollup/rollup-linux-x64-gnu --save-optional
+ARG VITE_API_URL=
 ENV VITE_API_URL=${VITE_API_URL}
 RUN npm run build
 
@@ -56,8 +58,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && git config --global url."https://github.com/".insteadOf ssh://git@github.com/ \
   && git config --global url."https://github.com/".insteadOf git@github.com:
 
-# Copy backend package.json (has "type": "module" needed for ESM runtime)
-COPY backend/package.json ./
+# Copy package.json files
+COPY backend/package.json ./package.json
 
 # Copy node_modules from builder (already compiled for Node.js ABI)
 COPY --from=builder /app/node_modules ./node_modules

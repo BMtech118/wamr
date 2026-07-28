@@ -55,6 +55,10 @@ const envSchema = z.object({
   // Media Monitoring
   MEDIA_MONITORING_INTERVAL_MS: z.string().transform(Number).default('300000'), // 5 minutes default
 
+  // Emby - used to verify that completed media is visible before notifying users
+  EMBY_URL: z.string().optional(),
+  EMBY_TOKEN: z.string().optional(),
+
   // Broadcast
   BROADCAST_DEFAULT_THROTTLE_MS: z.string().transform(Number).default('2500'),
   BROADCAST_DEFAULT_JITTER_MS: z.string().transform(Number).default('500'),

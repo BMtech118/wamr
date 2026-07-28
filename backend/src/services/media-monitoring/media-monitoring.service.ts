@@ -2,7 +2,10 @@
  * Media Monitoring Service
  *
  * Periodically checks Radarr/Sonarr/Overseerr for request completion
- * and notifies users via WhatsApp when their requested media becomes available
+ * and notifies users via WhatsApp when their requested media becomes available.
+ *
+ * TV series notifications are season-level only — one message per newly
+ * completed season, no per-episode messages.
  */
 
 import { logger } from '../../config/logger.js';
@@ -127,32 +130,24 @@ class MediaMonitoringService {
       isAvailable: boolean;
       isPartial?: boolean;
       availableSeasons?: number[];
-      availableEpisodes?: Record<number, number[]>;
       totalSeasons?: number;
     } = { isAvailable: false };
 
     try {
-      if (service.serviceType === 'seerr') {
+      if (service.serviceType === 'overseerr') {
         availabilityInfo = await this.checkOverseerrStatus(service.baseUrl, apiKey, request);
       } else if (service.serviceType === 'radarr' && request.mediaType === 'movie') {
         const isAvailable = await this.checkRadarrStatus(service.baseUrl, apiKey, request);
         availabilityInfo = { isAvailable };
       } else if (service.serviceType === 'sonarr' && request.mediaType === 'series') {
-        const sonarrInfo = await this.checkSonarrStatus(service.baseUrl, apiKey, request);
-        availabilityInfo = sonarrInfo;
+        availabilityInfo = await this.checkSonarrStatus(service.baseUrl, apiKey, request);
       }
 
-      // Handle series with season tracking
+      // Handle series with season tracking (season-level only, no episode notifications)
       if (request.mediaType === 'series' && availabilityInfo.availableSeasons) {
         await this.handleSeriesSeasonUpdates(request, availabilityInfo);
-
-        // Also handle episode-level notifications if we have episode data
-        if (availabilityInfo.availableEpisodes) {
-          await this.handleEpisodeUpdates(request, availabilityInfo.availableEpisodes);
-        }
       } else if (availabilityInfo.isAvailable && request.mediaType === 'movie') {
-        // Movies - simple notification
-        logger.info({ requestId: request.id, title: request.title }, 'Movie is now available!');
+        logger.info({ requestId: request.id, title: request.title }, 'Movie has been downloaded!');
 
         await requestHistoryRepository.update(request.id, {
           status: 'APPROVED',
@@ -209,78 +204,36 @@ class MediaMonitoringService {
       const isFullyAvailable = status === 5;
       const isPartiallyAvailable = status === 4;
 
-      // If it's a TV series and partially available, get season details
-      if (isPartiallyAvailable && request.mediaType === 'series' && request.tmdbId) {
+      // Get season details for TV series
+      if ((isPartiallyAvailable || isFullyAvailable) && request.mediaType === 'series' && request.tmdbId) {
         try {
           const tvDetails = await client.getTvDetails(request.tmdbId);
           const availableSeasons: number[] = [];
           const totalSeasons = tvDetails.seasons.filter((s: any) => s.seasonNumber > 0).length;
 
-          // Check which seasons are available
           if (tvDetails.mediaInfo?.seasons) {
             for (const season of tvDetails.mediaInfo.seasons) {
-              // Season status 5 = fully available, 4 = partially available
-              // We accept both because Sonarr will verify actual episode completion
               if (season.status === 5 || season.status === 4) {
                 availableSeasons.push(season.seasonNumber);
               }
             }
           }
 
-          logger.debug(
-            {
-              requestId: request.id,
-              status,
-              availableSeasons,
-              totalSeasons,
-            },
-            'Overseerr TV series partially available'
-          );
-
           return {
             isAvailable: true,
-            isPartial: true,
+            isPartial: isPartiallyAvailable,
             availableSeasons: availableSeasons.length > 0 ? availableSeasons : undefined,
             totalSeasons,
           };
         } catch (error) {
           logger.error(
             { error, requestId: request.id },
-            'Error fetching TV details for partial availability'
+            'Error fetching TV details from Overseerr'
           );
-          // Fall back to basic partial availability notification
           return {
             isAvailable: true,
-            isPartial: true,
+            isPartial: isPartiallyAvailable,
           };
-        }
-      }
-
-      // Check for fully available TV series to get total seasons
-      if (isFullyAvailable && request.mediaType === 'series' && request.tmdbId) {
-        try {
-          const tvDetails = await client.getTvDetails(request.tmdbId);
-          const availableSeasons: number[] = [];
-          const totalSeasons = tvDetails.seasons.filter((s: any) => s.seasonNumber > 0).length;
-
-          if (tvDetails.mediaInfo?.seasons) {
-            for (const season of tvDetails.mediaInfo.seasons) {
-              // Season status 5 = fully available, 4 = partially available
-              // We accept both because Sonarr will verify actual episode completion
-              if (season.status === 5 || season.status === 4) {
-                availableSeasons.push(season.seasonNumber);
-              }
-            }
-          }
-
-          return {
-            isAvailable: true,
-            isPartial: false,
-            availableSeasons: availableSeasons.length > 0 ? availableSeasons : undefined,
-            totalSeasons,
-          };
-        } catch (error) {
-          logger.error({ error, requestId: request.id }, 'Error fetching TV details');
         }
       }
 
@@ -300,164 +253,10 @@ class MediaMonitoringService {
   }
 
   /**
-   * Handle episode-level updates for TV series
-   * Notifies when new episodes become available
-   */
-  private async handleEpisodeUpdates(
-    request: any,
-    availableEpisodes: Record<number, number[]>
-  ): Promise<void> {
-    const notifiedEpisodes: Record<string, number[]> = request.notifiedEpisodes || {};
-
-    logger.debug(
-      {
-        requestId: request.id,
-        availableEpisodes,
-        notifiedEpisodes,
-      },
-      'Checking episode updates'
-    );
-
-    const newEpisodes: Array<{ season: number; episode: number }> = [];
-
-    // Find newly available episodes that haven't been notified yet
-    for (const [seasonStr, episodeNumbers] of Object.entries(availableEpisodes)) {
-      const seasonNum = parseInt(seasonStr, 10);
-      const notified = notifiedEpisodes[seasonStr] || [];
-
-      for (const episodeNum of episodeNumbers) {
-        if (!notified.includes(episodeNum)) {
-          newEpisodes.push({ season: seasonNum, episode: episodeNum });
-        }
-      }
-    }
-
-    if (newEpisodes.length === 0) {
-      logger.debug({ requestId: request.id }, 'No new episodes to notify about');
-      return;
-    }
-
-    // Sort by season then episode
-    newEpisodes.sort((a, b) => {
-      if (a.season !== b.season) return a.season - b.season;
-      return a.episode - b.episode;
-    });
-
-    logger.info(
-      {
-        requestId: request.id,
-        title: request.title,
-        newEpisodeCount: newEpisodes.length,
-        episodes: newEpisodes,
-      },
-      'New episodes available - notifying user'
-    );
-
-    // Send notification
-    await this.notifyUserEpisodesAvailable(request, newEpisodes);
-
-    // Update notified episodes
-    const updatedNotifiedEpisodes = { ...notifiedEpisodes };
-    for (const { season, episode } of newEpisodes) {
-      const seasonKey = season.toString();
-      if (!updatedNotifiedEpisodes[seasonKey]) {
-        updatedNotifiedEpisodes[seasonKey] = [];
-      }
-      if (!updatedNotifiedEpisodes[seasonKey].includes(episode)) {
-        updatedNotifiedEpisodes[seasonKey].push(episode);
-      }
-    }
-
-    // Sort episode numbers within each season
-    for (const seasonKey in updatedNotifiedEpisodes) {
-      updatedNotifiedEpisodes[seasonKey].sort((a, b) => a - b);
-    }
-
-    await requestHistoryRepository.update(request.id, {
-      notifiedEpisodes: updatedNotifiedEpisodes,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-
-  /**
-   * Notify user about newly available episodes
-   */
-  private async notifyUserEpisodesAvailable(
-    request: any,
-    episodes: Array<{ season: number; episode: number }>
-  ): Promise<void> {
-    try {
-      const phoneNumber = await this.getPhoneNumber(request);
-      if (!phoneNumber) return;
-
-      const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
-      const yearStr = request.year ? ` (${request.year})` : '';
-
-      let message: string;
-
-      if (episodes.length === 1) {
-        // Single episode notification
-        const { season, episode } = episodes[0];
-        message =
-          `📺 *New Episode Available!*\n\n` +
-          `*${request.title}${yearStr}*\n\n` +
-          `✨ Season ${season} Episode ${episode} is now ready to watch!\n\n` +
-          `Enjoy! 🍿`;
-      } else if (episodes.length <= 5) {
-        // Small batch - list all episodes
-        const episodeList = episodes
-          .map(({ season, episode }) => `S${season}E${episode}`)
-          .join(', ');
-
-        message =
-          `📺 *${episodes.length} New Episodes Available!*\n\n` +
-          `*${request.title}${yearStr}*\n\n` +
-          `✨ Episodes ${episodeList} are now ready to watch!\n\n` +
-          `Happy binge-watching! 🍿`;
-      } else {
-        // Large batch - group by season
-        const bySeason: Record<number, number[]> = {};
-        for (const { season, episode } of episodes) {
-          if (!bySeason[season]) bySeason[season] = [];
-          bySeason[season].push(episode);
-        }
-
-        const seasonSummary = Object.entries(bySeason)
-          .map(([season, eps]) => {
-            if (eps.length === 1) {
-              return `Season ${season} Episode ${eps[0]}`;
-            } else {
-              return `Season ${season}: ${eps.length} episodes`;
-            }
-          })
-          .join('\n');
-
-        message =
-          `📺 *${episodes.length} New Episodes Available!*\n\n` +
-          `*${request.title}${yearStr}*\n\n` +
-          `${seasonSummary}\n\n` +
-          `Happy binge-watching! 🍿`;
-      }
-
-      await whatsappClientService.sendMessage(phoneNumber, message);
-
-      logger.info(
-        {
-          requestId: request.id,
-          title: request.title,
-          episodeCount: episodes.length,
-          phoneNumber: phoneNumber.slice(-4),
-        },
-        'Sent episode availability notification to user'
-      );
-    } catch (error) {
-      logger.error({ error, requestId: request.id }, 'Error sending episode notification');
-    }
-  }
-
-  /**
-   * Handle season-level updates for TV series
-   * Consolidates all season updates into a single notification to prevent spam.
+   * Handle season-level updates for TV series.
+   * Sends ONE notification per cycle with all newly completed seasons.
+   * Marks request as APPROVED when all available seasons have been notified
+   * (treats null selectedSeasons as "all seasons").
    */
   private async handleSeriesSeasonUpdates(
     request: any,
@@ -468,11 +267,17 @@ class MediaMonitoringService {
       totalSeasons?: number;
     }
   ): Promise<void> {
-    const requestedSeasons: number[] = request.selectedSeasons || [];
     const notifiedSeasons: number[] = request.notifiedSeasons || [];
     const availableSeasons = availabilityInfo.availableSeasons || [];
     const currentTotalSeasons = availabilityInfo.totalSeasons || 0;
     const previousTotalSeasons = request.totalSeasons || 0;
+
+    // Treat null/empty selectedSeasons as "all seasons" (fixes the bug where
+    // selectedSeasons was never stored, causing requests to stay SUBMITTED forever)
+    const requestedSeasons: number[] =
+      request.selectedSeasons && request.selectedSeasons.length > 0
+        ? request.selectedSeasons
+        : availableSeasons;
 
     logger.debug(
       {
@@ -486,73 +291,68 @@ class MediaMonitoringService {
       'Checking series season updates'
     );
 
-    // Find newly available seasons that haven't been notified yet
+    // Find newly completed seasons that haven't been notified yet
     const newlyAvailableSeasons = availableSeasons.filter(
       (season) => !notifiedSeasons.includes(season)
     );
 
-    if (newlyAvailableSeasons.length === 0 && currentTotalSeasons <= previousTotalSeasons) {
-      logger.debug({ requestId: request.id }, 'No new seasons to notify about');
-      return;
+    // Initialize total seasons tracking on first check
+    if (currentTotalSeasons > 0 && previousTotalSeasons === 0) {
+      await requestHistoryRepository.update(request.id, {
+        totalSeasons: currentTotalSeasons,
+        updatedAt: new Date().toISOString(),
+      });
     }
 
-    // Collect all updates to send in a single notification
-    const newlyAvailableRequestedSeasons = newlyAvailableSeasons.filter((season) =>
-      requestedSeasons.includes(season)
-    );
-
-    const newAvailableUnrequestedSeasons = newlyAvailableSeasons.filter(
-      (season) => !requestedSeasons.includes(season) && season > Math.max(...requestedSeasons, 0)
-    );
-
-    const hasNewReleases = currentTotalSeasons > previousTotalSeasons && previousTotalSeasons > 0;
-    const newReleaseSeasonNumbers: number[] = [];
-    if (hasNewReleases) {
+    // Detect new season releases (total season count increased)
+    if (currentTotalSeasons > previousTotalSeasons && previousTotalSeasons > 0) {
+      const newSeasonNumbers: number[] = [];
       for (let i = previousTotalSeasons + 1; i <= currentTotalSeasons; i++) {
-        newReleaseSeasonNumbers.push(i);
+        newSeasonNumbers.push(i);
       }
-    }
 
-    // Only send ONE consolidated notification per check cycle
-    const hasRequestedUpdates = newlyAvailableRequestedSeasons.length > 0;
-    const hasUnrequestedUpdates = newAvailableUnrequestedSeasons.length > 0;
-
-    if (hasRequestedUpdates || hasUnrequestedUpdates || hasNewReleases) {
       logger.info(
         {
           requestId: request.id,
           title: request.title,
-          requestedSeasons: newlyAvailableRequestedSeasons,
-          unrequestedSeasons: newAvailableUnrequestedSeasons,
-          newReleases: newReleaseSeasonNumbers,
+          newSeasons: newSeasonNumbers,
+          previousTotal: previousTotalSeasons,
+          currentTotal: currentTotalSeasons,
         },
-        'Sending consolidated season availability notification'
+        'New seasons released - notifying user'
       );
 
-      await this.notifyUserConsolidatedSeasonUpdate(
-        request,
-        newlyAvailableRequestedSeasons,
-        newAvailableUnrequestedSeasons,
-        newReleaseSeasonNumbers
+      await this.notifyUserNewSeasonReleased(request, newSeasonNumbers);
+
+      await requestHistoryRepository.update(request.id, {
+        totalSeasons: currentTotalSeasons,
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    // Send a single notification for all newly available seasons
+    if (newlyAvailableSeasons.length > 0) {
+      logger.info(
+        {
+          requestId: request.id,
+          title: request.title,
+          seasons: newlyAvailableSeasons,
+        },
+        'Seasons newly available - notifying user'
       );
+
+      await this.notifyUserSeasonsAvailable(request, newlyAvailableSeasons);
+
+      // Update notified seasons
+      const updatedNotifiedSeasons = [...notifiedSeasons, ...newlyAvailableSeasons];
+      await requestHistoryRepository.update(request.id, {
+        notifiedSeasons: updatedNotifiedSeasons,
+        totalSeasons: currentTotalSeasons || previousTotalSeasons,
+        updatedAt: new Date().toISOString(),
+      });
     }
 
-    // Update notified seasons (all newly available seasons)
-    const allNewlyNotified = [...new Set([...notifiedSeasons, ...newlyAvailableSeasons])].sort(
-      (a, b) => a - b
-    );
-
-    // Update total seasons count if needed
-    const updateData: any = {
-      notifiedSeasons: allNewlyNotified,
-      updatedAt: new Date().toISOString(),
-    };
-    if (currentTotalSeasons > 0) {
-      updateData.totalSeasons = currentTotalSeasons;
-    }
-    await requestHistoryRepository.update(request.id, updateData);
-
-    // Check if all requested seasons are now available
+    // Check if all requested seasons are now available — mark as APPROVED
     const allRequestedAvailable =
       requestedSeasons.length > 0 &&
       requestedSeasons.every((season) => availableSeasons.includes(season));
@@ -571,14 +371,11 @@ class MediaMonitoringService {
   }
 
   /**
-   * Send a single consolidated notification for all season updates
-   * Prevents spam by combining requested, unrequested, and new-release seasons into one message.
+   * Notify user about newly available seasons — single message for all new seasons
    */
-  private async notifyUserConsolidatedSeasonUpdate(
+  private async notifyUserSeasonsAvailable(
     request: any,
-    requestedSeasons: number[],
-    unrequestedSeasons: number[],
-    newReleases: number[]
+    seasons: number[]
   ): Promise<void> {
     try {
       const phoneNumber = await this.getPhoneNumber(request);
@@ -586,43 +383,18 @@ class MediaMonitoringService {
 
       const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
       const yearStr = request.year ? ` (${request.year})` : '';
+      const sortedSeasons = seasons.sort((a, b) => a - b);
+      const seasonList =
+        sortedSeasons.length === 1
+          ? `Season ${sortedSeasons[0]}`
+          : sortedSeasons.length === 2
+            ? `Seasons ${sortedSeasons[0]} and ${sortedSeasons[1]}`
+            : `Seasons ${sortedSeasons.slice(0, -1).join(', ')} and ${sortedSeasons[sortedSeasons.length - 1]}`;
 
-      let message = `🎉 *Update on ${request.title}${yearStr}*\n\n`;
-
-      if (requestedSeasons.length > 0) {
-        const list = requestedSeasons
-          .sort((a, b) => a - b)
-          .map((s) => `Season ${s}`)
-          .join(', ');
-        message += `✅ *Available:* ${list}\n`;
-        message +=
-          requestedSeasons.length === 1
-            ? 'Your requested season is now ready!\n'
-            : 'Your requested seasons are now ready!\n';
-      }
-
-      if (unrequestedSeasons.length > 0) {
-        const list = unrequestedSeasons
-          .sort((a, b) => a - b)
-          .map((s) => `Season ${s}`)
-          .join(', ');
-        message += `\n🆕 *Also Available:* ${list}\n`;
-        message += `These weren't part of your original request, but they're ready too!\n`;
-      }
-
-      if (newReleases.length > 0) {
-        const list = newReleases
-          .sort((a, b) => a - b)
-          .map((s) => `Season ${s}`)
-          .join(', ');
-        message += `\n📢 *Announced:* ${list}\n`;
-        message +=
-          newReleases.length === 1
-            ? "It's been announced and may be available soon!\n"
-            : "They've been announced and may be available soon!\n";
-      }
-
-      message += `\nHappy watching! 🍿`;
+      const message =
+        `🎉 *Great news!*\n\n` +
+        `📺 *${request.title}${yearStr}*\n\n` +
+        `✅ ${seasonList} ${seasons.length === 1 ? 'has' : 'have'} been downloaded and will usually be available to watch within an hour.`;
 
       await whatsappClientService.sendMessage(phoneNumber, message);
 
@@ -630,18 +402,48 @@ class MediaMonitoringService {
         {
           requestId: request.id,
           title: request.title,
-          requestedSeasons,
-          unrequestedSeasons,
-          newReleases,
+          seasons,
           phoneNumber: phoneNumber.slice(-4),
         },
-        'Sent consolidated season update notification'
+        'Sent season availability notification to user'
       );
     } catch (error) {
-      logger.error(
-        { error, requestId: request.id },
-        'Error sending consolidated season notification'
+      logger.error({ error, requestId: request.id }, 'Error sending season notification');
+    }
+  }
+
+  /**
+   * Notify user about new season release (total season count increased)
+   */
+  private async notifyUserNewSeasonReleased(request: any, newSeasons: number[]): Promise<void> {
+    try {
+      const phoneNumber = await this.getPhoneNumber(request);
+      if (!phoneNumber) return;
+
+      const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
+      const yearStr = request.year ? ` (${request.year})` : '';
+      const seasonList =
+        newSeasons.length === 1 ? `Season ${newSeasons[0]}` : `Seasons ${newSeasons.join(', ')}`;
+
+      const message =
+        `🆕 *New Season Announcement!*\n\n` +
+        `📺 *${request.title}${yearStr}*\n\n` +
+        `🎬 ${seasonList} ${newSeasons.length === 1 ? 'has' : 'have'} been announced!\n\n` +
+        `${newSeasons.length === 1 ? 'It' : 'They'} may not be available yet, but we'll let you know when ${newSeasons.length === 1 ? 'it is' : 'they are'}!`;
+
+      await whatsappClientService.sendMessage(phoneNumber, message);
+
+      logger.info(
+        {
+          requestId: request.id,
+          title: request.title,
+          seasons: newSeasons,
+          phoneNumber: phoneNumber.slice(-4),
+        },
+        'Sent new season announcement to user'
       );
+    } catch (error) {
+      logger.error({ error, requestId: request.id }, 'Error sending new season announcement');
     }
   }
 
@@ -649,7 +451,6 @@ class MediaMonitoringService {
    * Get phone number for notifications (helper method)
    */
   private async getPhoneNumber(request: any): Promise<string | null> {
-    // First, try to get phone number from encrypted field
     let phoneNumber: string | null = null;
 
     if (request.phoneNumberEncrypted) {
@@ -664,16 +465,6 @@ class MediaMonitoringService {
       }
     }
 
-    // Fallback 1: replyJid (for LID users without phoneNumber)
-    if (!phoneNumber && request.replyJid) {
-      phoneNumber = request.replyJid;
-      logger.debug(
-        { requestId: request.id, replyJid: request.replyJid },
-        'Using replyJid as notification target'
-      );
-    }
-
-    // Fallback 2: try to get from active phone numbers map (if user has active session)
     if (!phoneNumber) {
       const { conversationService } = await import('../conversation/conversation.service.js');
       const { conversationSessionRepository } = await import(
@@ -704,7 +495,6 @@ class MediaMonitoringService {
     const client = new RadarrClient(baseUrl, apiKey);
 
     try {
-      // Get movie by TMDB ID
       if (!request.tmdbId) {
         logger.warn({ requestId: request.id }, 'Request missing TMDB ID for Radarr check');
         return false;
@@ -720,7 +510,6 @@ class MediaMonitoringService {
         return false;
       }
 
-      // Check if movie has file (hasFile indicates the movie is downloaded and available)
       const isAvailable = movie.hasFile === true;
 
       logger.debug(
@@ -742,7 +531,7 @@ class MediaMonitoringService {
   }
 
   /**
-   * Check Sonarr for series availability
+   * Check Sonarr for series availability (season-level only, no episode fetching)
    */
   private async checkSonarrStatus(
     baseUrl: string,
@@ -752,13 +541,11 @@ class MediaMonitoringService {
     isAvailable: boolean;
     isPartial?: boolean;
     availableSeasons?: number[];
-    availableEpisodes?: Record<number, number[]>;
     totalSeasons?: number;
   }> {
     const client = new SonarrClient(baseUrl, apiKey);
 
     try {
-      // Get series by TVDB ID
       if (!request.tvdbId) {
         logger.warn({ requestId: request.id }, 'Request missing TVDB ID for Sonarr check');
         return { isAvailable: false };
@@ -774,55 +561,23 @@ class MediaMonitoringService {
         return { isAvailable: false };
       }
 
-      // Check if series has any downloaded episodes
       const episodeFileCount = series.statistics?.episodeFileCount ?? 0;
       const isAvailable = episodeFileCount > 0;
 
-      // Try to get season-level details
+      // Get season-level details
       let availableSeasons: number[] = [];
       const totalSeasons = series.seasons?.length ?? 0;
 
       if (series.seasons) {
         availableSeasons = series.seasons
           .filter((season: any) => {
-            // Season is available if ALL AIRED episodes are downloaded
-            // episodeFileCount = number of downloaded episodes
-            // episodeCount = number of episodes that have aired (not including future unaired episodes)
-            // totalEpisodeCount = total episodes including future unaired ones
             const hasEpisodes = season.statistics?.episodeCount > 0;
             const allAiredEpisodesDownloaded =
               season.statistics?.episodeFileCount >= season.statistics?.episodeCount;
-
             return hasEpisodes && allAiredEpisodesDownloaded;
           })
           .map((season: any) => season.seasonNumber)
-          .filter((num: number) => num > 0); // Exclude season 0 (specials)
-      }
-
-      // NEW: Get episode-level availability for Sonarr (get actual seriesId first)
-      let availableEpisodes: Record<number, number[]> | undefined;
-
-      // Find the Sonarr series ID (from the series list, it should have an ID)
-      try {
-        const allSeries = await client.getSeries();
-        const fullSeries = allSeries.find((s) => s.tvdbId === request.tvdbId);
-
-        if (fullSeries && (fullSeries as any).id) {
-          availableEpisodes = await client.getAvailableEpisodesBySeason((fullSeries as any).id);
-          logger.debug(
-            {
-              requestId: request.id,
-              episodeCount: Object.values(availableEpisodes).flat().length,
-            },
-            'Fetched episode-level availability from Sonarr'
-          );
-        }
-      } catch (error) {
-        logger.warn(
-          { error, requestId: request.id },
-          'Failed to fetch episode-level data from Sonarr'
-        );
-        // Continue without episode data
+          .filter((num: number) => num > 0);
       }
 
       logger.debug(
@@ -832,7 +587,6 @@ class MediaMonitoringService {
           episodeFileCount,
           totalSeasons,
           availableSeasons,
-          hasEpisodeData: !!availableEpisodes,
           monitored: series.monitored,
           isAvailable,
         },
@@ -842,7 +596,6 @@ class MediaMonitoringService {
       return {
         isAvailable,
         availableSeasons: availableSeasons.length > 0 ? availableSeasons : undefined,
-        availableEpisodes,
         totalSeasons: totalSeasons > 0 ? totalSeasons : undefined,
       };
     } catch (error) {
@@ -862,42 +615,19 @@ class MediaMonitoringService {
       availableSeasons?: number[];
     }
   ): Promise<void> {
+    void availabilityInfo;
     try {
       const phoneNumber = await this.getPhoneNumber(request);
       if (!phoneNumber) return;
 
-      // Send notification via WhatsApp
       const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
 
       const emoji = request.mediaType === 'movie' ? '🎬' : '📺';
       const yearStr = request.year ? ` (${request.year})` : '';
 
-      let message: string;
-
-      if (availabilityInfo.isPartial && request.mediaType === 'series') {
-        // Partially available TV series
-        let availabilityDetails = '';
-
-        if (availabilityInfo.availableSeasons && availabilityInfo.availableSeasons.length > 0) {
-          const sortedSeasons = availabilityInfo.availableSeasons.sort((a, b) => a - b);
-          const seasonList = sortedSeasons.map((s) => `Season ${s}`).join(', ');
-          availabilityDetails = `\n\n✅ *Available:* ${seasonList}`;
-        } else {
-          availabilityDetails = '\n\n⚠️ Some content is now available.';
-        }
-
-        message =
-          `🎉 *Good news!*\n\n` +
-          `${emoji} *${request.title}${yearStr}* is now partially available in your library!` +
-          availabilityDetails +
-          `\n\nYou can start watching the available content now. More episodes may be added soon!`;
-      } else {
-        // Fully available (movies or complete TV series)
-        message =
-          `🎉 *Good news!*\n\n` +
-          `${emoji} *${request.title}${yearStr}* is now available in your library!\n\n` +
-          `You can start watching it now.`;
-      }
+      const message =
+        `🎉 *Good news!*\n\n` +
+        `${emoji} *${request.title}${yearStr}* has been downloaded and will usually be available to watch within an hour.`;
 
       await whatsappClientService.sendMessage(phoneNumber, message);
 
@@ -906,8 +636,6 @@ class MediaMonitoringService {
           requestId: request.id,
           title: request.title,
           phoneNumber: phoneNumber.slice(-4),
-          isPartial: availabilityInfo.isPartial,
-          availableSeasons: availabilityInfo.availableSeasons,
         },
         'Sent availability notification to user'
       );

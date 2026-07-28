@@ -6,7 +6,7 @@
 /**
  * Service types supported by the system
  */
-export type ServiceType = 'radarr' | 'sonarr' | 'seerr';
+export type ServiceType = 'radarr' | 'sonarr' | 'seerr' | 'overseerr';
 
 /**
  * Media service configuration status

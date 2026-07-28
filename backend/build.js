@@ -27,6 +27,8 @@ const sharedConfig = {
     'qrcode-terminal',
     'zod',
     'express-rate-limit',
+    'socks-proxy-agent',
+    'socks',
   ],
   minify: false,
   keepNames: true,

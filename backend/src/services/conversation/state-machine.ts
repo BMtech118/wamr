@@ -9,7 +9,8 @@ import { logger } from '../../config/logger.js';
  * State transition rules for the conversation state machine
  */
 const STATE_TRANSITIONS: Record<ConversationState, ConversationState[]> = {
-  IDLE: ['SEARCHING', 'IDLE'], // Allow self-transition for cancel/timeout
+  IDLE: ['AWAITING_INPUT', 'SEARCHING', 'IDLE'], // Can go to AWAITING_INPUT when prefix-only message received
+  AWAITING_INPUT: ['SEARCHING', 'IDLE'], // User provides search query or cancels
   SEARCHING: ['AWAITING_SELECTION', 'IDLE'], // IDLE for no results
   AWAITING_SELECTION: ['AWAITING_SEASON_SELECTION', 'AWAITING_CONFIRMATION', 'IDLE'], // Season selection for TV series
   AWAITING_SEASON_SELECTION: ['AWAITING_CONFIRMATION', 'IDLE'], // IDLE for cancel
@@ -128,11 +129,11 @@ export class StateMachine {
    * IDLE → SEARCHING
    */
   private handleStartSearch(currentState: ConversationState): StateTransitionResult {
-    if (currentState !== 'IDLE') {
+    if (currentState !== 'IDLE' && currentState !== 'AWAITING_INPUT') {
       return {
         newState: currentState,
         valid: false,
-        error: 'Can only start search from IDLE state',
+        error: 'Can only start search from IDLE or AWAITING_INPUT state',
       };
     }
 
@@ -282,6 +283,7 @@ export class StateMachine {
   getStateDescription(state: ConversationState): string {
     const descriptions: Record<ConversationState, string> = {
       IDLE: 'No active conversation',
+      AWAITING_INPUT: 'Waiting for user to describe what they want to watch',
       SEARCHING: 'Searching for media',
       AWAITING_SELECTION: 'Waiting for user to select from results',
       AWAITING_SEASON_SELECTION: 'Waiting for user to select seasons',
@@ -304,6 +306,7 @@ export class StateMachine {
    */
   requiresUserInput(state: ConversationState): boolean {
     return (
+      state === 'AWAITING_INPUT' ||
       state === 'AWAITING_SELECTION' ||
       state === 'AWAITING_SEASON_SELECTION' ||
       state === 'AWAITING_CONFIRMATION'
@@ -316,6 +319,7 @@ export class StateMachine {
   getExpectedInput(state: ConversationState): string {
     const expectedInputs: Record<ConversationState, string> = {
       IDLE: 'Media request (e.g., "I want to watch Inception")',
+      AWAITING_INPUT: 'Media request (e.g., "I want to watch Inception")',
       SEARCHING: 'Please wait...',
       AWAITING_SELECTION: 'Selection number (1-5) or CANCEL',
       AWAITING_SEASON_SELECTION: 'Season numbers (e.g., "1,2,3" or "all") or CANCEL',

@@ -14,6 +14,7 @@ export interface IntentResult {
     | 'unknown';
   mediaType?: MediaType;
   query?: string;
+  imdbId?: string;
   selectionNumber?: number;
   confirmed?: boolean;
   seasons?: 'all' | number[];
@@ -114,6 +115,18 @@ export class IntentParser {
       const confirmed = this.isConfirmed(normalizedMessage);
       logger.debug({ message, confirmed }, 'Detected confirmation intent');
       return { intent: 'confirmation', confirmed };
+    }
+
+    // Check for IMDb link/ID (before general media request parsing)
+    const imdbId = this.parseImdbLink(message);
+    if (imdbId) {
+      logger.debug({ message, imdbId }, 'Detected IMDb link intent');
+      return {
+        intent: 'media_request',
+        mediaType: 'both',
+        query: `imdb:${imdbId}`,
+        imdbId,
+      };
     }
 
     // Check for media request intent
@@ -218,6 +231,29 @@ export class IntentParser {
       if (regex.test(message)) {
         return number;
       }
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse IMDb link or bare IMDb ID from message
+   * Supports: https://www.imdb.com/title/tt0903747/, https://m.imdb.com/title/tt0903747,
+   * imdb.com/title/tt0903747, or bare tt0903747
+   */
+  private parseImdbLink(message: string): string | null {
+    // Match IMDb URLs (with or without protocol, www/m subdomain, trailing slash/params)
+    const urlMatch = message.match(
+      /(?:https?:\/\/)?(?:www\.|m\.)?imdb\.com\/title\/(tt\d+)/i
+    );
+    if (urlMatch) {
+      return urlMatch[1].toLowerCase();
+    }
+
+    // Match bare IMDb IDs (tt followed by 7+ digits)
+    const idMatch = message.match(/\b(tt\d{7,})\b/i);
+    if (idMatch) {
+      return idMatch[1].toLowerCase();
     }
 
     return null;

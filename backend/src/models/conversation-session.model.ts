@@ -3,6 +3,7 @@ import { ConversationSession, NewConversationSession } from '../db/schema.js';
 /**
  * Conversation state machine states
  * IDLE: No active conversation
+ * AWAITING_INPUT: User triggered the prefix command, waiting for their search query
  * SEARCHING: Media search in progress
  * AWAITING_SELECTION: User needs to select from search results
  * AWAITING_SEASON_SELECTION: User needs to select which seasons (for TV series)
@@ -11,6 +12,7 @@ import { ConversationSession, NewConversationSession } from '../db/schema.js';
  */
 export type ConversationState =
   | 'IDLE'
+  | 'AWAITING_INPUT'
   | 'SEARCHING'
   | 'AWAITING_SELECTION'
   | 'AWAITING_SEASON_SELECTION'

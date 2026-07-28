@@ -177,7 +177,14 @@ export class RadarrClient {
 
       return response.data;
     } catch (error) {
-      logger.error({ error, title: params.title }, 'Failed to add movie to Radarr');
+      const axiosError = error as any;
+      logger.error({
+        error,
+        title: params.title,
+        tmdbId: params.tmdbId,
+        responseStatus: axiosError?.response?.status,
+        responseData: axiosError?.response?.data,
+      }, 'Failed to add movie to Radarr');
       throw error;
     }
   }

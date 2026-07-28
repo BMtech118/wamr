@@ -18,9 +18,9 @@ import {
   normalizeSonarrResult,
   normalizeOverseerrResult,
   deduplicateResults,
-  rankResults,
+  sortResultsByYear,
+  sortResultsByRelevance,
   limitResults,
-  type SortMode,
 } from '../../types/media-result.types';
 
 /**
@@ -114,7 +114,7 @@ class ResultNormalizerService {
    */
   normalizeOverseerrResults(
     results: OverseerrSearchResult[],
-    source: ServiceType = 'seerr'
+    source: ServiceType = 'overseerr'
   ): NormalizedResult[] {
     try {
       logger.debug('Normalizing Overseerr results', {
@@ -154,17 +154,12 @@ class ResultNormalizerService {
    * Process and deduplicate search results from multiple sources
    * Returns up to maxResults unique results, sorted by year (most recent first)
    */
-  processResults(
-    results: NormalizedResult[],
-    maxResults: number = 5,
-    query: string = '',
-    sortMode: SortMode = 'relevance'
-  ): NormalizedResult[] {
+  processResults(results: NormalizedResult[], maxResults: number = 5, query?: string): NormalizedResult[] {
     try {
       logger.debug('Processing search results', {
         inputCount: results.length,
         maxResults,
-        sortMode,
+        query,
       });
 
       // Step 1: Deduplicate results
@@ -175,8 +170,10 @@ class ResultNormalizerService {
         removed: results.length - deduplicated.length,
       });
 
-      // Step 2: Rank / sort results
-      const sorted = rankResults(deduplicated, query, sortMode);
+      // Step 2: Sort by relevance if query is provided, otherwise by year
+      const sorted = query
+        ? sortResultsByRelevance(deduplicated, query)
+        : sortResultsByYear(deduplicated);
 
       // Step 3: Limit to max results
       const limited = limitResults(sorted, maxResults);
@@ -201,14 +198,13 @@ class ResultNormalizerService {
     sonarrResults: SonarrSeriesResult[] = [],
     overseerrResults: OverseerrSearchResult[] = [],
     maxResults: number = 5,
-    query: string = '',
-    sortMode: SortMode = 'relevance'
+    query?: string
   ): NormalizedResult[] {
     try {
       logger.debug('Combining results from multiple sources', {
         radarr: radarrResults.length,
         sonarr: sonarrResults.length,
-        seerr: overseerrResults.length,
+        overseerr: overseerrResults.length,
       });
 
       // Normalize results from each source
@@ -223,8 +219,8 @@ class ResultNormalizerService {
         total: combined.length,
       });
 
-      // Process combined results (deduplicate, rank, limit)
-      return this.processResults(combined, maxResults, query, sortMode);
+      // Process combined results (deduplicate, sort by relevance, limit)
+      return this.processResults(combined, maxResults, query);
     } catch (error) {
       logger.error('Error combining and processing results', { error });
       return [];

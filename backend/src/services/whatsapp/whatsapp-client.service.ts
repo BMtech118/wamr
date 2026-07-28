@@ -7,6 +7,7 @@ import {
 } from '@whiskeysockets/baileys';
 import type { proto } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 
 type WASocket = ReturnType<typeof makeWASocket>;
 import { logger } from '../../config/logger.js';
@@ -15,6 +16,7 @@ import { hashingService } from '../encryption/hashing.service.js';
 import { contactRepository } from '../../repositories/contact.repository.js';
 import { whatsappConnectionRepository } from '../../repositories/whatsapp-connection.repository.js';
 import type { WhatsAppConnectionStatus } from '../../models/whatsapp-connection.model.js';
+import { messageFilterService } from './message-filter.service.js';
 
 /**
  * Baileys message type (simplified for our use case)
@@ -140,8 +142,16 @@ export class WhatsAppClientService {
       // Build browser label: WAMR (DEV) in development, WAMR (PROD) in production
       const browserLabel = env.NODE_ENV === 'development' ? 'WAMR (DEV)' : 'WAMR (PROD)';
 
+      // Preserve Telebox's optional proxy routing and selective receipt filtering.
+      const proxyUrl = process.env.WA_PROXY_URL || '';
+      const agent = proxyUrl ? new SocksProxyAgent(proxyUrl) : undefined;
+      if (agent) {
+        logger.info('Using configured SOCKS5 proxy for WhatsApp connection');
+      }
+      await messageFilterService.initialize();
+
       // Create Baileys socket
-      this.sock = makeWASocket({
+      const socketConfig = {
         auth: state,
         printQRInTerminal: false, // We'll handle QR code ourselves via WebSocket
         browser: [browserLabel, 'Desktop', ''] as [string, string, string],
@@ -150,7 +160,12 @@ export class WhatsAppClientService {
         markOnlineOnConnect,
         // Disable auto-retry to handle reconnection manually
         retryRequestDelayMs: 2000,
-      });
+        agent,
+        // Added by Telebox's postinstall Baileys patch. Protocol ACKs continue,
+        // while delivery receipts and events are limited to messages WAMR handles.
+        shouldSendReceipt: (msg: BaileysMessage) => messageFilterService.shouldSendReceipt(msg as any),
+      };
+      this.sock = makeWASocket(socketConfig as Parameters<typeof makeWASocket>[0]);
 
       logger.debug('WhatsApp Baileys socket instance created, setting up event handlers...');
       this.setupEventHandlers();
