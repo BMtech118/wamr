@@ -45,6 +45,7 @@ export class WhatsAppClientService {
   private hasCalledReady = false; // Track if ready callback has been called for current connection
   private initializationTimeout: NodeJS.Timeout | null = null;
   private markOnlineOnConnect = false; // Updated on initialize() and via setMarkOnlineOnConnect()
+  private presenceKeepalive: NodeJS.Timeout | null = null;
 
   private qrCodeCallback: ((qr: string) => void) | null = null;
   private messageCallback: ((message: BaileysMessage) => void) | null = null;
@@ -192,6 +193,47 @@ export class WhatsAppClientService {
   }
 
   /**
+   * Tell WhatsApp this companion is NOT online.
+   *
+   * Presence is the difference between your phone buzzing and not. If WhatsApp
+   * believes any linked device is 'available', it assumes you are reading there
+   * and stops pushing to the handset.
+   */
+  private async assertUnavailable(reason: string): Promise<void> {
+    if (!this.sock) return;
+    try {
+      await this.sock.sendPresenceUpdate('unavailable');
+      logger.debug({ reason }, 'Asserted unavailable presence');
+    } catch (error) {
+      // Worth a warning rather than a debug: when this fails silently the
+      // symptom is "my phone stopped notifying me", which is impossible to
+      // trace back to here.
+      logger.warn({ error, reason }, 'Failed to assert unavailable presence');
+    }
+  }
+
+  /**
+   * Re-assert it periodically. Baileys sends 'available' on its own before every
+   * outgoing message, and a send that fails partway leaves the account online
+   * with nothing to correct it until the next successful send.
+   */
+  private startPresenceKeepalive(): void {
+    this.stopPresenceKeepalive();
+    this.presenceKeepalive = setInterval(() => {
+      if (this.sock && !this.markOnlineOnConnect) void this.assertUnavailable('keepalive');
+    }, 5 * 60 * 1000);
+    // Do not hold the process open just for this.
+    this.presenceKeepalive.unref?.();
+  }
+
+  private stopPresenceKeepalive(): void {
+    if (this.presenceKeepalive) {
+      clearInterval(this.presenceKeepalive);
+      this.presenceKeepalive = null;
+    }
+  }
+
+  /**
    * Setup event handlers for Baileys
    */
   private setupEventHandlers(): void {
@@ -274,6 +316,23 @@ export class WhatsAppClientService {
 
           logger.info({ phoneHash }, 'WhatsApp connected');
 
+          // Assert 'unavailable' on EVERY connect, not just after sending.
+          //
+          // markOnlineOnConnect:false makes Baileys send nothing about presence
+          // at all, so WhatsApp keeps whatever it last knew. If that was
+          // 'available' — from a send whose restore failed, from a session when
+          // the setting was still on, or from a socket that dropped mid-send —
+          // the account stays online forever from WhatsApp's point of view, and
+          // it stops pushing notifications to the phone because it thinks you
+          // are already reading them on this device.
+          //
+          // This box reconnects often (503 stream errors), and every one of
+          // those was previously a fresh socket that never corrected it.
+          if (!this.markOnlineOnConnect) {
+            await this.assertUnavailable('connect');
+            this.startPresenceKeepalive();
+          }
+
           // Emit status update via WebSocket
           const { qrCodeEmitterService } = await import('./qr-code-emitter.service.js');
           qrCodeEmitterService.emitConnectionStatus('connected', phoneNumber);
@@ -293,6 +352,7 @@ export class WhatsAppClientService {
 
       // Handle connection close (disconnected)
       if (connection === 'close') {
+        this.stopPresenceKeepalive();
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
         const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
 
