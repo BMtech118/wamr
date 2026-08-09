@@ -39,6 +39,8 @@ class MessageFilterService {
   private filterKeyword: string | null = null;
   private filterType: string | null = null;
   private adminPhoneDigits: string | null = null;
+  /** Mirrors whatsapp_connections.process_groups. Default false, matching the DB default. */
+  private processGroups = false;
   private lastConfigRefresh = 0;
   private configRefreshInterval = 60_000; // Refresh config every 60s
 
@@ -65,6 +67,7 @@ class MessageFilterService {
       // Load filter config
       const connections = await whatsappConnectionRepository.findAll();
       if (connections.length > 0) {
+        this.processGroups = Boolean(connections[0].processGroups);
         this.filterType = connections[0].filterType || null;
         if (this.filterType === 'prefix') {
           this.filterPrefix = connections[0].filterValue || null;
@@ -123,8 +126,24 @@ class MessageFilterService {
       // Always process messages from self (sent from another device)
       if (msg.key?.fromMe) return true;
 
-      // Always process group messages (shouldn't reach here, but safety)
-      if (msg.key?.remoteJid?.endsWith('@g.us')) return true;
+      // Group messages.
+      //
+      // This used to `return true` unconditionally, with a comment saying it
+      // "shouldn't reach here". It does reach here — every group message you
+      // receive lands in this function — and returning true sends the delivery
+      // receipt, which is precisely what stops the phone notifying you.
+      //
+      // So WAMR was killing notifications for EVERY group chat, including ones
+      // it then ignored, because process_groups is off. Now: if we are not
+      // processing groups we do not ack them either. If we are, they fall
+      // through to the normal filter, so only an actual /request gets acked.
+      if (msg.key?.remoteJid?.endsWith('@g.us') && !this.processGroups) {
+        logger.debug(
+          { from: msg.key.remoteJid.slice(-12) },
+          'WAMR filter: group message, process_groups is off — skipping receipt'
+        );
+        return false;
+      }
 
       // Extract message text
       const text =
