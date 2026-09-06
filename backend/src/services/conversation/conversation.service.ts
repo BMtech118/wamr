@@ -366,13 +366,16 @@ export class ConversationService {
         'Media search completed'
       );
 
+      // Grab the reply JID BEFORE completion handling. handleSearchComplete
+      // deletes the in-memory maps on the no-results path, so reading it after
+      // always yields undefined and the reply gets dropped — the user is left
+      // on "Searching..." forever.
+      const replyJid = this.activeReplyJids.get(sessionId);
+
       // Handle search completion
       const response = await this.handleSearchComplete(sessionId, searchResult.results);
 
       if (response) {
-        // Get reply JID for this session (for sending messages)
-        const replyJid = this.activeReplyJids.get(sessionId);
-
         if (replyJid) {
           // Import whatsappClientService dynamically to avoid circular dependency
           const { whatsappClientService } = await import('../whatsapp/whatsapp-client.service.js');
@@ -1060,6 +1063,10 @@ export class ConversationService {
     } catch (error) {
       logger.error({ sessionId, error }, 'Fatal error in submitRequest');
 
+      // Same ordering trap as performSearch: read the JID before the completion
+      // handler clears the maps.
+      const replyJid = this.activeReplyJids.get(sessionId);
+
       const response = await this.handleSubmissionComplete(
         sessionId,
         false,
@@ -1067,7 +1074,6 @@ export class ConversationService {
       );
 
       if (response) {
-        const replyJid = this.activeReplyJids.get(sessionId);
         if (replyJid) {
           try {
             const { whatsappClientService } = await import(
